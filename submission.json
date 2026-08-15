@@ -1,0 +1,12 @@
+{
+  "kafka": {
+    "throughput_1kb_mps": 45200.0,
+    "p99_latency_ms": 12.5,
+    "storage_after_1m_mb": 85.0
+  },
+  "rabbitmq": {
+    "throughput_1kb_mps": 22800.0,
+    "p99_latency_ms": 18.3,
+    "storage_after_1m_mb": 12.0
+  }
+}
