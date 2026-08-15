@@ -1,0 +1,335 @@
+# =============================================================================
+# Event Streaming Architectures - Docker Compose
+# Dual-pipeline order processing: Apache Kafka + RabbitMQ
+# =============================================================================
+# Usage: docker-compose up -d
+# All services start with a single command and pass health checks within 120s.
+
+version: "3.9"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Apache Kafka (KRaft mode - no Zookeeper dependency)
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      # KRaft mode configuration
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Cluster settings
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Log retention
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    networks:
+      - streaming-net
+
+  # ---------------------------------------------------------------------------
+  # Kafka Topic Initialization
+  # ---------------------------------------------------------------------------
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "
+      echo 'Waiting for Kafka to be fully ready...'
+      sleep 5
+
+      echo 'Creating topic: orders (3 partitions, RF=1)...'
+      kafka-topics --bootstrap-server kafka:9092 \
+        --create --if-not-exists \
+        --topic orders \
+        --partitions 3 \
+        --replication-factor 1
+
+      echo 'Verifying topic creation...'
+      kafka-topics --bootstrap-server kafka:9092 \
+        --describe --topic orders
+
+      echo 'Kafka initialization complete.'
+      "
+    networks:
+      - streaming-net
+
+  # ---------------------------------------------------------------------------
+  # Kafdrop - Kafka Web UI
+  # ---------------------------------------------------------------------------
+  kafdrop:
+    image: obsidiandynamics/kafdrop:4.0.2
+    container_name: kafdrop
+    ports:
+      - "9000:9000"
+    environment:
+      KAFKA_BROKERCONNECT: kafka:9092
+      JVM_OPTS: "-Xms32M -Xmx64M"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/actuator/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - streaming-net
+
+  # ---------------------------------------------------------------------------
+  # RabbitMQ with Management Plugin
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    hostname: rabbitmq
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_DEFAULT_VHOST: /
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+    networks:
+      - streaming-net
+
+  # ---------------------------------------------------------------------------
+  # Order Producer (publishes to both Kafka and RabbitMQ)
+  # ---------------------------------------------------------------------------
+  producer:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: order-producer
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672/}
+      ORDER_TOPIC_NAME: ${ORDER_TOPIC_NAME:-orders}
+      ORDER_EXCHANGE_NAME: ${ORDER_EXCHANGE_NAME:-order-exchange}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PRODUCER_MODE: continuous
+      MESSAGES_PER_BATCH: 100
+      BATCH_INTERVAL_SECONDS: 2
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - benchmark-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os; exit(0 if os.path.exists(\"/tmp/producer_healthy\") else 1)'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - streaming-net
+
+  # ---------------------------------------------------------------------------
+  # Kafka Consumers (3 independent consumer groups)
+  # ---------------------------------------------------------------------------
+  kafka-consumer-inventory:
+    build:
+      context: ./consumer-kafka
+      dockerfile: Dockerfile
+    container_name: kafka-consumer-inventory
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      ORDER_TOPIC_NAME: ${ORDER_TOPIC_NAME:-orders}
+      GROUP_ID: inventory-cg
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    volumes:
+      - benchmark-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os; exit(0 if os.path.exists(\"/tmp/consumer_healthy\") else 1)'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - streaming-net
+
+  kafka-consumer-notification:
+    build:
+      context: ./consumer-kafka
+      dockerfile: Dockerfile
+    container_name: kafka-consumer-notification
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      ORDER_TOPIC_NAME: ${ORDER_TOPIC_NAME:-orders}
+      GROUP_ID: notification-cg
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    volumes:
+      - benchmark-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os; exit(0 if os.path.exists(\"/tmp/consumer_healthy\") else 1)'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - streaming-net
+
+  kafka-consumer-analytics:
+    build:
+      context: ./consumer-kafka
+      dockerfile: Dockerfile
+    container_name: kafka-consumer-analytics
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      ORDER_TOPIC_NAME: ${ORDER_TOPIC_NAME:-orders}
+      GROUP_ID: analytics-cg
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    volumes:
+      - benchmark-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os; exit(0 if os.path.exists(\"/tmp/consumer_healthy\") else 1)'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - streaming-net
+
+  # ---------------------------------------------------------------------------
+  # RabbitMQ Consumers (3 independent queue consumers)
+  # ---------------------------------------------------------------------------
+  rabbitmq-consumer-inventory:
+    build:
+      context: ./consumer-rabbitmq
+      dockerfile: Dockerfile
+    container_name: rabbitmq-consumer-inventory
+    env_file: .env
+    environment:
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672/}
+      QUEUE_NAME: inventory-q
+      ORDER_EXCHANGE_NAME: ${ORDER_EXCHANGE_NAME:-order-exchange}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - benchmark-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os; exit(0 if os.path.exists(\"/tmp/consumer_healthy\") else 1)'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - streaming-net
+
+  rabbitmq-consumer-notification:
+    build:
+      context: ./consumer-rabbitmq
+      dockerfile: Dockerfile
+    container_name: rabbitmq-consumer-notification
+    env_file: .env
+    environment:
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672/}
+      QUEUE_NAME: notification-q
+      ORDER_EXCHANGE_NAME: ${ORDER_EXCHANGE_NAME:-order-exchange}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - benchmark-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os; exit(0 if os.path.exists(\"/tmp/consumer_healthy\") else 1)'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - streaming-net
+
+  rabbitmq-consumer-analytics:
+    build:
+      context: ./consumer-rabbitmq
+      dockerfile: Dockerfile
+    container_name: rabbitmq-consumer-analytics
+    env_file: .env
+    environment:
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@rabbitmq:5672/}
+      QUEUE_NAME: analytics-q
+      ORDER_EXCHANGE_NAME: ${ORDER_EXCHANGE_NAME:-order-exchange}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - benchmark-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import os; exit(0 if os.path.exists(\"/tmp/consumer_healthy\") else 1)'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - streaming-net
+
+# =============================================================================
+# Volumes & Networks
+# =============================================================================
+volumes:
+  kafka-data:
+    driver: local
+  rabbitmq-data:
+    driver: local
+  benchmark-data:
+    driver: local
+
+networks:
+  streaming-net:
+    driver: bridge
+    name: streaming-network
